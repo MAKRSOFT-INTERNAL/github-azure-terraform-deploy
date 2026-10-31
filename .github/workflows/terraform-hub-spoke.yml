@@ -2,18 +2,48 @@ name: Terraform Hub-Spoke Network
 
 on:
   workflow_dispatch:
+    inputs:
+
+      # ---------------------------------------------------------
+      # Terraform Action
+      # ---------------------------------------------------------
+      action:
+        description: "Select Terraform action"
+        required: true
+        type: choice
+        options:
+          - apply
+          - destroy
+        default: apply
+
+      # ---------------------------------------------------------
+      # Environment
+      # ---------------------------------------------------------
+      environment:
+        description: "Select environment"
+        required: true
+        type: choice
+        options:
+          - dev
+        default: dev
+
 
 permissions:
   id-token: write
   contents: write
 
+
 concurrency:
-  group: terraform-hub-spoke-network
+  group: terraform-hub-spoke-${{ inputs.environment }}
   cancel-in-progress: false
 
+
 jobs:
+
   terraform:
-    name: Deploy Azure Hub-Spoke Network
+
+    name: Terraform ${{ inputs.action }} - ${{ inputs.environment }}
+
     runs-on: ubuntu-latest
 
     env:
@@ -26,6 +56,7 @@ jobs:
       run:
         working-directory: terraform
 
+
     steps:
 
       # ---------------------------------------------------------
@@ -34,8 +65,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+
       # ---------------------------------------------------------
-      # 2. Authenticate to Azure using GitHub OIDC
+      # 2. Display selected parameters
+      # ---------------------------------------------------------
+      - name: Display Deployment Parameters
+        run: |
+          echo "=========================================="
+          echo "Terraform Deployment"
+          echo "=========================================="
+          echo "Action      : ${{ inputs.action }}"
+          echo "Environment : ${{ inputs.environment }}"
+          echo "=========================================="
+
+
+      # ---------------------------------------------------------
+      # 3. Authenticate to Azure using GitHub OIDC
       # ---------------------------------------------------------
       - name: Azure Login using OIDC
         uses: azure/login@v3
@@ -44,8 +89,9 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+
       # ---------------------------------------------------------
-      # 3. Verify Azure authentication and RBAC
+      # 4. Verify Azure authentication and RBAC
       # ---------------------------------------------------------
       - name: Verify Azure access
         run: |
@@ -58,59 +104,106 @@ jobs:
           echo "===== rg-app-dev ====="
           az group show --name rg-app-dev
 
+
       # ---------------------------------------------------------
-      # 4. Install Terraform
+      # 5. Install Terraform
       # ---------------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+
       # ---------------------------------------------------------
-      # 5. Initialize Terraform
+      # 6. Initialize Terraform
       # ---------------------------------------------------------
       - name: Terraform Init
         run: terraform init
 
+
       # ---------------------------------------------------------
-      # 6. Check Terraform formatting
+      # 7. Check Terraform formatting
       # ---------------------------------------------------------
       - name: Terraform Format Check
         run: terraform fmt -check -recursive
 
+
       # ---------------------------------------------------------
-      # 7. Validate Terraform
+      # 8. Validate Terraform
       # ---------------------------------------------------------
       - name: Terraform Validate
         run: terraform validate
 
+
       # ---------------------------------------------------------
-      # 8. Generate Terraform Plan
+      # 9. Generate Terraform Plan
       # ---------------------------------------------------------
       - name: Terraform Plan
         run: |
-          terraform plan \
-            -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
-            -var-file="environments/dev.tfvars" \
-            -out=tfplan
+          if [ "${{ inputs.action }}" = "destroy" ]; then
+
+            echo "Generating Terraform DESTROY plan..."
+
+            terraform plan \
+              -destroy \
+              -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+              -var-file="environments/${{ inputs.environment }}.tfvars" \
+              -out=tfplan
+
+          else
+
+            echo "Generating Terraform APPLY plan..."
+
+            terraform plan \
+              -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+              -var-file="environments/${{ inputs.environment }}.tfvars" \
+              -out=tfplan
+
+          fi
+
 
       # ---------------------------------------------------------
-      # 9. Apply Terraform Plan
+      # 10. Apply Terraform
       # ---------------------------------------------------------
       - name: Terraform Apply
-        run: terraform apply -auto-approve tfplan
+        if: inputs.action == 'apply'
+        run: |
+          echo "Applying Terraform plan..."
+
+          terraform apply \
+            -auto-approve \
+            tfplan
+
 
       # ---------------------------------------------------------
-      # 10. Display Terraform outputs
+      # 11. Destroy Terraform
+      # ---------------------------------------------------------
+      - name: Terraform Destroy
+        if: inputs.action == 'destroy'
+        run: |
+          echo "Destroying Terraform-managed infrastructure..."
+
+          terraform apply \
+            -auto-approve \
+            tfplan
+
+
+      # ---------------------------------------------------------
+      # 12. Display Terraform outputs
       # ---------------------------------------------------------
       - name: Terraform Outputs
-        run: terraform output
+        if: inputs.action == 'apply'
+        run: |
+          terraform output
+
 
       # ---------------------------------------------------------
-      # 11. Commit Terraform state to GitHub
+      # 13. Commit Terraform state to GitHub
       # ---------------------------------------------------------
       - name: Commit Terraform State
+        if: inputs.action == 'apply' || inputs.action == 'destroy'
         working-directory: .
         shell: bash
         run: |
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -121,8 +214,14 @@ jobs:
           fi
 
           if ! git diff --cached --quiet; then
-            git commit -m "chore: update terraform state [skip ci]"
+
+            git commit \
+              -m "chore: terraform ${{ inputs.action }} ${{ inputs.environment }} [skip ci]"
+
             git push
+
           else
+
             echo "No Terraform state changes to commit."
+
           fi
