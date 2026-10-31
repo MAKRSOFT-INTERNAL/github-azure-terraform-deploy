@@ -27,9 +27,16 @@ jobs:
         working-directory: terraform
 
     steps:
+
+      # ---------------------------------------------------------
+      # 1. Checkout repository
+      # ---------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ---------------------------------------------------------
+      # 2. Authenticate to Azure using GitHub OIDC
+      # ---------------------------------------------------------
       - name: Azure Login using OIDC
         uses: azure/login@v3
         with:
@@ -37,24 +44,47 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      # ---------------------------------------------------------
+      # 3. Verify Azure authentication and RBAC
+      # ---------------------------------------------------------
       - name: Verify Azure access
         run: |
+          echo "===== Azure Account ====="
           az account show
+
+          echo "===== rg-network ====="
           az group show --name rg-network
+
+          echo "===== rg-app-dev ====="
           az group show --name rg-app-dev
 
+      # ---------------------------------------------------------
+      # 4. Install Terraform
+      # ---------------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      # ---------------------------------------------------------
+      # 5. Initialize Terraform
+      # ---------------------------------------------------------
       - name: Terraform Init
         run: terraform init
 
+      # ---------------------------------------------------------
+      # 6. Check Terraform formatting
+      # ---------------------------------------------------------
       - name: Terraform Format Check
         run: terraform fmt -check -recursive
 
+      # ---------------------------------------------------------
+      # 7. Validate Terraform
+      # ---------------------------------------------------------
       - name: Terraform Validate
         run: terraform validate
 
+      # ---------------------------------------------------------
+      # 8. Generate Terraform Plan
+      # ---------------------------------------------------------
       - name: Terraform Plan
         run: |
           terraform plan \
@@ -62,12 +92,21 @@ jobs:
             -var-file="environments/dev.tfvars" \
             -out=tfplan
 
+      # ---------------------------------------------------------
+      # 9. Apply Terraform Plan
+      # ---------------------------------------------------------
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
 
+      # ---------------------------------------------------------
+      # 10. Display Terraform outputs
+      # ---------------------------------------------------------
       - name: Terraform Outputs
         run: terraform output
 
+      # ---------------------------------------------------------
+      # 11. Commit Terraform state to GitHub
+      # ---------------------------------------------------------
       - name: Commit Terraform State
         working-directory: .
         shell: bash
