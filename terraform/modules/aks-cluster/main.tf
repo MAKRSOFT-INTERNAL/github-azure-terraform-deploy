@@ -11,6 +11,10 @@ resource "azurerm_role_assignment" "system_subnet_network_contributor" {
   role_definition_name             = "Network Contributor"
   principal_id                     = azurerm_user_assigned_identity.aks.principal_id
   skip_service_principal_aad_check = true
+
+  lifecycle {
+    ignore_changes = [skip_service_principal_aad_check]
+  }
 }
 
 resource "azurerm_role_assignment" "user_subnet_network_contributor" {
@@ -18,6 +22,10 @@ resource "azurerm_role_assignment" "user_subnet_network_contributor" {
   role_definition_name             = "Network Contributor"
   principal_id                     = azurerm_user_assigned_identity.aks.principal_id
   skip_service_principal_aad_check = true
+
+  lifecycle {
+    ignore_changes = [skip_service_principal_aad_check]
+  }
 }
 
 resource "azurerm_kubernetes_cluster" "aks" {
