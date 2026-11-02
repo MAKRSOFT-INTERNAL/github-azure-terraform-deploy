@@ -28,6 +28,16 @@ output "aks_user_subnet_id" {
   value       = module.aks_spoke_network.aks_user_subnet_id
 }
 
+output "aks_cluster_id" {
+  description = "AKS cluster resource ID."
+  value       = module.aks_cluster.cluster_id
+}
+
+output "aks_cluster_name" {
+  description = "AKS cluster name."
+  value       = module.aks_cluster.cluster_name
+}
+
 output "private_endpoint_subnet_id" {
   description = "Private endpoint subnet ID."
   value       = module.aks_spoke_network.private_endpoint_subnet_id
