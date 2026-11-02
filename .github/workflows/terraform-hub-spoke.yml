@@ -114,7 +114,7 @@ jobs:
               --query id \
               --output tsv \
               --only-show-errors 2>&1); then
-              printf '%s' "$result"
+              printf '%s' "$resource_path"
             elif grep -Eqi 'ResourceNotFound|NotFound|could not be found|was not found' <<< "$result"; then
               printf ''
             else
