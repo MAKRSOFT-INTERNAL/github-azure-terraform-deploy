@@ -60,6 +60,8 @@ module "aks_cluster" {
 module "vnet_peering" {
   source = "./modules/vnet-peering"
 
+  depends_on = [module.aks_spoke_network]
+
   hub_resource_group_name = data.azurerm_resource_group.hub.name
   hub_vnet_name           = module.hub_network.vnet_name
   hub_vnet_id             = module.hub_network.vnet_id
