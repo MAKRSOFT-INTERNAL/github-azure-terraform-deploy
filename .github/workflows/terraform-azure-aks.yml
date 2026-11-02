@@ -121,7 +121,7 @@ jobs:
               return
             fi
 
-            if terraform state list | grep -Fxq "$address"; then
+            if terraform state list | grep -Fx "$address" >/dev/null; then
               echo "Already in state: $address"
               return
             fi
@@ -158,7 +158,7 @@ jobs:
                 --query "[?roleDefinitionName=='Network Contributor'].id | [0]" \
                 --output tsv)
               role_address="module.aks_cluster.azurerm_role_assignment.${pool}_subnet_network_contributor"
-              if [[ -n "$assignment_id" && "$assignment_id" != "None" ]] && ! terraform state list | grep -Fxq "$role_address"; then
+              if [[ -n "$assignment_id" && "$assignment_id" != "None" ]] && ! terraform state list | grep -Fx "$role_address" >/dev/null; then
                 terraform import \
                   -var="subscription_id=${ARM_SUBSCRIPTION_ID}" \
                   -var-file="../environments/aks-${{ inputs.environment }}.tfvars" \

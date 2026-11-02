@@ -139,7 +139,7 @@ jobs:
               return
             fi
 
-            if terraform state list | grep -Fxq "$address"; then
+            if terraform state list | grep -Fx "$address" >/dev/null; then
               echo "Already in state: $address"
               return
             fi
