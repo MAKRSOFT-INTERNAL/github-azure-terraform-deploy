@@ -39,7 +39,6 @@ resource "azurerm_kubernetes_cluster" "aks" {
     min_count                    = var.system_min_count
     max_count                    = var.system_max_count
     only_critical_addons_enabled = true
-    os_type                      = "Linux"
     type                         = "VirtualMachineScaleSets"
   }
 
