@@ -1,0 +1,219 @@
+name: Terraform Azure AKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Terraform action
+        required: true
+        type: choice
+        options:
+          - apply
+          - destroy
+        default: apply
+      environment:
+        description: Deployment environment
+        required: true
+        type: choice
+        options:
+          - dev
+        default: dev
+  workflow_call:
+    inputs:
+      action:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: write
+
+concurrency:
+  group: terraform-stage-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  aks:
+    name: AKS ${{ inputs.action }} - ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    env:
+      ARM_USE_OIDC: true
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    defaults:
+      run:
+        working-directory: terraform/aks
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Azure Login using OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify Azure access and provider registration
+        shell: bash
+        run: |
+          az account show --output none
+          az group show --name rg-app-dev --output none
+
+          for namespace in Microsoft.Network Microsoft.ManagedIdentity Microsoft.Compute Microsoft.ContainerService Microsoft.Authorization; do
+            state=$(az provider show --namespace "$namespace" --query registrationState --output tsv)
+            if [[ "$state" != "Registered" ]]; then
+              echo "::error::$namespace is not registered. Ask a subscription administrator to run: az provider register --namespace $namespace --wait"
+              exit 1
+            fi
+          done
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Format Check
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Import existing AKS resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          lookup_resource_id() {
+            local requested_id="$1"
+            local result
+
+            if result=$(az resource show \
+              --ids "$requested_id" \
+              --query id \
+              --output tsv \
+              --only-show-errors 2>&1); then
+              printf '%s' "$result"
+            elif grep -Eqi 'ResourceNotFound|NotFound|could not be found|was not found' <<< "$result"; then
+              printf ''
+            else
+              printf '%s\n' "$result" >&2
+              return 1
+            fi
+          }
+
+          import_if_present() {
+            local address="$1"
+            local requested_id="$2"
+            local resource_id
+
+            resource_id=$(lookup_resource_id "$requested_id")
+            if [[ -z "$resource_id" ]]; then
+              echo "Not found; Terraform will create it if required: $address"
+              return
+            fi
+
+            if terraform state list | grep -Fxq "$address"; then
+              echo "Already in state: $address"
+              return
+            fi
+
+            echo "Importing $address"
+            terraform import \
+              -var="subscription_id=${ARM_SUBSCRIPTION_ID}" \
+              -var-file="../environments/aks-${{ inputs.environment }}.tfvars" \
+              "$address" \
+              "$resource_id"
+          }
+
+          subscription_id="$ARM_SUBSCRIPTION_ID"
+          identity_id="/subscriptions/${subscription_id}/resourceGroups/rg-app-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/aks-app-dev-identity"
+          cluster_id="/subscriptions/${subscription_id}/resourceGroups/rg-app-dev/providers/Microsoft.ContainerService/managedClusters/aks-app-dev"
+
+          import_if_present "module.aks_cluster.azurerm_user_assigned_identity.aks" "$identity_id"
+
+          identity_principal_id=$(az identity show \
+            --resource-group rg-app-dev \
+            --name aks-app-dev-identity \
+            --query principalId \
+            --output tsv 2>/dev/null || true)
+          for subnet in \
+            "system:snet-aks-system" \
+            "user:snet-aks-user"; do
+            pool="${subnet%%:*}"
+            subnet_name="${subnet#*:}"
+            subnet_id="/subscriptions/${subscription_id}/resourceGroups/rg-app-dev/providers/Microsoft.Network/virtualNetworks/vnet-aks-spoke/subnets/${subnet_name}"
+            if [[ -n "$identity_principal_id" ]]; then
+              assignment_id=$(az role assignment list \
+                --scope "$subnet_id" \
+                --assignee-object-id "$identity_principal_id" \
+                --query "[?roleDefinitionName=='Network Contributor'].id | [0]" \
+                --output tsv)
+              role_address="module.aks_cluster.azurerm_role_assignment.${pool}_subnet_network_contributor"
+              if [[ -n "$assignment_id" && "$assignment_id" != "None" ]] && ! terraform state list | grep -Fxq "$role_address"; then
+                terraform import \
+                  -var="subscription_id=${ARM_SUBSCRIPTION_ID}" \
+                  -var-file="../environments/aks-${{ inputs.environment }}.tfvars" \
+                  "$role_address" \
+                  "$assignment_id"
+              fi
+            fi
+          done
+
+          import_if_present "module.aks_cluster.azurerm_kubernetes_cluster.aks" "$cluster_id"
+          import_if_present \
+            "module.aks_cluster.azurerm_kubernetes_cluster_node_pool.user" \
+            "${cluster_id}/agentPools/userpool"
+
+      - name: Terraform Plan
+        shell: bash
+        run: |
+          if [[ "${{ inputs.action }}" == "destroy" ]]; then
+            terraform plan -destroy \
+              -var="subscription_id=${ARM_SUBSCRIPTION_ID}" \
+              -var-file="../environments/aks-${{ inputs.environment }}.tfvars" \
+              -out=tfplan
+          else
+            terraform plan \
+              -var="subscription_id=${ARM_SUBSCRIPTION_ID}" \
+              -var-file="../environments/aks-${{ inputs.environment }}.tfvars" \
+              -out=tfplan
+          fi
+
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Destroy
+        if: inputs.action == 'destroy'
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Outputs
+        if: inputs.action == 'apply'
+        run: terraform output
+
+      - name: Commit Terraform state
+        if: success()
+        working-directory: .
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add terraform/aks/terraform.tfstate terraform/aks/.terraform.lock.hcl
+          if [[ -f terraform/aks/terraform.tfstate.backup ]]; then
+            git add terraform/aks/terraform.tfstate.backup
+          fi
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update AKS Terraform state [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          else
+            echo "No AKS state changes to commit."
+          fi

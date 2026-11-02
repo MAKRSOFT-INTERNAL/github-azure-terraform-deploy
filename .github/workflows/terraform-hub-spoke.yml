@@ -3,85 +3,56 @@ name: Terraform Hub-Spoke Network
 on:
   workflow_dispatch:
     inputs:
-
-      # ---------------------------------------------------------
-      # Terraform Action
-      # ---------------------------------------------------------
       action:
-        description: "Select Terraform action"
+        description: Terraform action
         required: true
         type: choice
         options:
           - apply
           - destroy
         default: apply
-
-      # ---------------------------------------------------------
-      # Environment
-      # ---------------------------------------------------------
       environment:
-        description: "Select environment"
+        description: Deployment environment
         required: true
         type: choice
         options:
           - dev
         default: dev
-
+  workflow_call:
+    inputs:
+      action:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
 
 permissions:
   id-token: write
   contents: write
 
-
 concurrency:
-  group: terraform-hub-spoke-${{ inputs.environment }}
+  group: terraform-stage-${{ inputs.environment }}
   cancel-in-progress: false
 
-
 jobs:
-
-  terraform:
-
-    name: Terraform ${{ inputs.action }} - ${{ inputs.environment }}
-
+  network:
+    name: Network ${{ inputs.action }} - ${{ inputs.environment }}
     runs-on: ubuntu-latest
-
     env:
       ARM_USE_OIDC: true
       ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
     defaults:
       run:
         working-directory: terraform
-
-
     steps:
-
-      # ---------------------------------------------------------
-      # 1. Checkout repository
-      # ---------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
 
-
-      # ---------------------------------------------------------
-      # 2. Display selected parameters
-      # ---------------------------------------------------------
-      - name: Display Deployment Parameters
-        run: |
-          echo "=========================================="
-          echo "Terraform Deployment"
-          echo "=========================================="
-          echo "Action      : ${{ inputs.action }}"
-          echo "Environment : ${{ inputs.environment }}"
-          echo "=========================================="
-
-
-      # ---------------------------------------------------------
-      # 3. Authenticate to Azure using GitHub OIDC
-      # ---------------------------------------------------------
       - name: Azure Login using OIDC
         uses: azure/login@v3
         with:
@@ -89,139 +60,182 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-
-      # ---------------------------------------------------------
-      # 4. Verify Azure authentication and RBAC
-      # ---------------------------------------------------------
-      - name: Verify Azure access
+      - name: Verify Azure access and provider registration
+        shell: bash
         run: |
-          echo "===== Azure Account ====="
-          az account show
+          az account show --output none
+          az group show --name rg-network --output none
+          az group show --name rg-app-dev --output none
 
-          echo "===== rg-network ====="
-          az group show --name rg-network
+          state=$(az provider show --namespace Microsoft.Network --query registrationState --output tsv)
+          if [[ "$state" != "Registered" ]]; then
+            echo "::error::Microsoft.Network is not registered. Ask a subscription administrator to run: az provider register --namespace Microsoft.Network --wait"
+            exit 1
+          fi
 
-          echo "===== rg-app-dev ====="
-          az group show --name rg-app-dev
+      - name: Protect AKS network dependencies during destroy
+        if: inputs.action == 'destroy'
+        shell: bash
+        run: |
+          cluster_id="/subscriptions/${ARM_SUBSCRIPTION_ID}/resourceGroups/rg-app-dev/providers/Microsoft.ContainerService/managedClusters/aks-app-dev"
+          if result=$(az resource show --ids "$cluster_id" --query id --output tsv --only-show-errors 2>&1); then
+            echo "::error::AKS cluster still exists. Destroy the full deployment through terraform-deploy.yml so AKS is removed before its network."
+            exit 1
+          elif grep -Eqi 'ResourceNotFound|NotFound|could not be found|was not found' <<< "$result"; then
+            echo "No AKS cluster found; network destroy can continue."
+          else
+            printf '%s\n' "$result" >&2
+            exit 1
+          fi
 
-
-      # ---------------------------------------------------------
-      # 5. Install Terraform
-      # ---------------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-
-      # ---------------------------------------------------------
-      # 6. Initialize Terraform
-      # ---------------------------------------------------------
       - name: Terraform Init
         run: terraform init
 
-
-      # ---------------------------------------------------------
-      # 7. Check Terraform formatting
-      # ---------------------------------------------------------
       - name: Terraform Format Check
         run: terraform fmt -check -recursive
 
-
-      # ---------------------------------------------------------
-      # 8. Validate Terraform
-      # ---------------------------------------------------------
       - name: Terraform Validate
         run: terraform validate
 
-
-      # ---------------------------------------------------------
-      # 9. Generate Terraform Plan
-      # ---------------------------------------------------------
-      - name: Terraform Plan
+      - name: Import existing network resources
+        shell: bash
         run: |
-          if [ "${{ inputs.action }}" = "destroy" ]; then
+          set -euo pipefail
 
-            echo "Generating Terraform DESTROY plan..."
+          lookup_resource_id() {
+            local resource_path="$1"
+            local result
 
-            terraform plan \
-              -destroy \
-              -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+            if result=$(az resource show \
+              --ids "$resource_path" \
+              --query id \
+              --output tsv \
+              --only-show-errors 2>&1); then
+              printf '%s' "$result"
+            elif grep -Eqi 'ResourceNotFound|NotFound|could not be found|was not found' <<< "$result"; then
+              printf ''
+            else
+              printf '%s\n' "$result" >&2
+              return 1
+            fi
+          }
+
+          import_if_present() {
+            local address="$1"
+            local requested_id="$2"
+            local resource_id
+
+            if [[ -z "$requested_id" ]]; then
+              echo "Not found; Terraform will create it if required: $address"
+              return
+            fi
+
+            resource_id=$(lookup_resource_id "$requested_id")
+            if [[ -z "$resource_id" ]]; then
+              echo "Not found; Terraform will create it if required: $address"
+              return
+            fi
+
+            if terraform state list | grep -Fxq "$address"; then
+              echo "Already in state: $address"
+              return
+            fi
+
+            echo "Importing $address"
+            terraform import \
+              -var="subscription_id=${ARM_SUBSCRIPTION_ID}" \
+              -var-file="environments/${{ inputs.environment }}.tfvars" \
+              "$address" \
+              "$resource_id"
+          }
+
+          subscription_id="$ARM_SUBSCRIPTION_ID"
+          hub_vnet_id="/subscriptions/${subscription_id}/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-hub"
+          spoke_vnet_id="/subscriptions/${subscription_id}/resourceGroups/rg-app-dev/providers/Microsoft.Network/virtualNetworks/vnet-aks-spoke"
+          aks_nsg_id="/subscriptions/${subscription_id}/resourceGroups/rg-app-dev/providers/Microsoft.Network/networkSecurityGroups/vnet-aks-spoke-aks-nodes-nsg"
+
+          import_if_present "module.hub_network.azurerm_virtual_network.hub" "$hub_vnet_id"
+          import_if_present "module.hub_network.azurerm_subnet.gateway" "${hub_vnet_id}/subnets/GatewaySubnet"
+          import_if_present "module.hub_network.azurerm_subnet.firewall" "${hub_vnet_id}/subnets/AzureFirewallSubnet"
+          import_if_present "module.aks_spoke_network.azurerm_virtual_network.spoke" "$spoke_vnet_id"
+          import_if_present "module.aks_spoke_network.azurerm_network_security_group.aks_nodes" "$aks_nsg_id"
+
+          for subnet in \
+            "aks_system:snet-aks-system" \
+            "aks_user:snet-aks-user" \
+            "private_endpoints:snet-private-endpoints" \
+            "app_gateway:snet-app-gateway"; do
+            address_suffix="${subnet%%:*}"
+            subnet_name="${subnet#*:}"
+            subnet_id="${spoke_vnet_id}/subnets/${subnet_name}"
+            existing_subnet_id=$(lookup_resource_id "$subnet_id")
+
+            import_if_present \
+              "module.aks_spoke_network.azurerm_subnet.${address_suffix}" \
+              "$existing_subnet_id"
+
+            if [[ -n "$existing_subnet_id" && ( "$address_suffix" == "aks_system" || "$address_suffix" == "aks_user" ) ]]; then
+              association_id=$(az network vnet subnet show \
+                --resource-group rg-app-dev \
+                --vnet-name vnet-aks-spoke \
+                --name "$subnet_name" \
+                --query networkSecurityGroup.id \
+                --output tsv)
+              if [[ -n "$association_id" && "$association_id" != "None" ]]; then
+                import_if_present \
+                  "module.aks_spoke_network.azurerm_subnet_network_security_group_association.${address_suffix}" \
+                  "$subnet_id"
+              fi
+            fi
+          done
+
+          import_if_present \
+            "module.vnet_peering.azurerm_virtual_network_peering.hub_to_spoke" \
+            "${hub_vnet_id}/virtualNetworkPeerings/peer-hub-to-aks-spoke"
+          import_if_present \
+            "module.vnet_peering.azurerm_virtual_network_peering.spoke_to_hub" \
+            "${spoke_vnet_id}/virtualNetworkPeerings/peer-aks-spoke-to-hub"
+
+      - name: Terraform Plan
+        shell: bash
+        run: |
+          if [[ "${{ inputs.action }}" == "destroy" ]]; then
+            terraform plan -destroy \
+              -var="subscription_id=${ARM_SUBSCRIPTION_ID}" \
               -var-file="environments/${{ inputs.environment }}.tfvars" \
               -out=tfplan
-
           else
-
-            echo "Generating Terraform APPLY plan..."
-
             terraform plan \
-              -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+              -var="subscription_id=${ARM_SUBSCRIPTION_ID}" \
               -var-file="environments/${{ inputs.environment }}.tfvars" \
               -out=tfplan
-
           fi
 
-
-      # ---------------------------------------------------------
-      # 10. Apply Terraform
-      # ---------------------------------------------------------
       - name: Terraform Apply
         if: inputs.action == 'apply'
-        run: |
-          echo "Applying Terraform plan..."
+        run: terraform apply -auto-approve tfplan
 
-          terraform apply \
-            -auto-approve \
-            tfplan
-
-
-      # ---------------------------------------------------------
-      # 11. Destroy Terraform
-      # ---------------------------------------------------------
       - name: Terraform Destroy
         if: inputs.action == 'destroy'
-        run: |
-          echo "Destroying Terraform-managed infrastructure..."
+        run: terraform apply -auto-approve tfplan
 
-          terraform apply \
-            -auto-approve \
-            tfplan
-
-
-      # ---------------------------------------------------------
-      # 12. Display Terraform outputs
-      # ---------------------------------------------------------
-      - name: Terraform Outputs
-        if: inputs.action == 'apply'
-        run: |
-          terraform output
-
-
-      # ---------------------------------------------------------
-      # 13. Commit Terraform state to GitHub
-      # ---------------------------------------------------------
-      - name: Commit Terraform State
-        if: inputs.action == 'apply' || inputs.action == 'destroy'
+      - name: Commit Terraform state
+        if: success()
         working-directory: .
         shell: bash
         run: |
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add terraform/terraform.tfstate
-
-          if [ -f terraform/terraform.tfstate.backup ]; then
+          git add terraform/terraform.tfstate terraform/.terraform.lock.hcl
+          if [[ -f terraform/terraform.tfstate.backup ]]; then
             git add terraform/terraform.tfstate.backup
           fi
-
           if ! git diff --cached --quiet; then
-
-            git commit \
-              -m "chore: terraform ${{ inputs.action }} ${{ inputs.environment }} [skip ci]"
-
-            git push
-
+            git commit -m "chore: update network Terraform state [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           else
-
-            echo "No Terraform state changes to commit."
-
+            echo "No network state changes to commit."
           fi

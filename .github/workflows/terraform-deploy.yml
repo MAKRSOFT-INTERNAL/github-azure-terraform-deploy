@@ -1,0 +1,63 @@
+name: Terraform Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Apply or destroy the full environment
+        required: true
+        type: choice
+        options:
+          - apply
+          - destroy
+        default: apply
+      environment:
+        description: Deployment environment
+        required: true
+        type: choice
+        options:
+          - dev
+        default: dev
+
+permissions:
+  id-token: write
+  contents: write
+
+concurrency:
+  group: terraform-deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  network_apply:
+    if: inputs.action == 'apply'
+    uses: ./.github/workflows/terraform-hub-spoke.yml
+    with:
+      action: apply
+      environment: ${{ inputs.environment }}
+    secrets: inherit
+
+  aks_apply:
+    needs: network_apply
+    if: inputs.action == 'apply' && needs.network_apply.result == 'success'
+    uses: ./.github/workflows/terraform-azure-aks.yml
+    with:
+      action: apply
+      environment: ${{ inputs.environment }}
+    secrets: inherit
+
+  aks_destroy:
+    if: inputs.action == 'destroy'
+    uses: ./.github/workflows/terraform-azure-aks.yml
+    with:
+      action: destroy
+      environment: ${{ inputs.environment }}
+    secrets: inherit
+
+  network_destroy:
+    needs: aks_destroy
+    if: inputs.action == 'destroy' && needs.aks_destroy.result == 'success'
+    uses: ./.github/workflows/terraform-hub-spoke.yml
+    with:
+      action: destroy
+      environment: ${{ inputs.environment }}
+    secrets: inherit
